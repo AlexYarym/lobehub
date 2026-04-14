@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: 3. Setup Bun (Добавленный шаг: установка среды Bun)
+      - name: 3. Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
