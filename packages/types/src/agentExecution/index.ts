@@ -1,6 +1,6 @@
 import type { LobeAgentChatConfig } from '../agent/chatConfig';
 import type { CreateThreadWithMessageParams } from '../aiChat';
-import type { WorkingDirConfig } from '../device';
+import type { DeviceUnavailableErrorData, WorkingDirConfig } from '../device';
 import type { TaskDetail, UIChatMessage } from '../message';
 import type { ChatTopic } from '../topic';
 
@@ -234,6 +234,8 @@ export interface ExecAgentParams {
    * use the internal `files` param instead.
    */
   fileIds?: string[];
+  /** Opt into runtime state snapshots on step_complete events. Defaults to false. */
+  includeFinalState?: boolean;
   /** Additional system instructions appended after the agent's own system role */
   instructions?: string;
   /** Current desktop's device ID; used only when the effective target is `local`. */
@@ -303,9 +305,7 @@ export interface ScheduleAgentRunResult {
   topicId: string;
 }
 
-/**
- * Response from execAgent
- */
+/** Response from execAgent. */
 export interface ExecAgentResult {
   /** The resolved agent ID */
   agentId: string;
@@ -319,6 +319,8 @@ export interface ExecAgentResult {
   createdThreadId?: string;
   /** Error message if operation failed to start */
   error?: string;
+  /** Structured availability context when a device dispatch failed before acceptance. */
+  errorData?: DeviceUnavailableErrorData;
   /**
    * External heterogeneous producer for this run. `null` explicitly denotes
    * the normal AgentRuntime path; `undefined` is reserved for rolling clients

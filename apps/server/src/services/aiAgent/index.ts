@@ -40,6 +40,7 @@ import type {
   AgentExecutionParams,
   AgentExecutionResult,
   AgentRuntimeServiceOptions,
+  AgentStepContinuation,
   SubAgentBridgeParams,
 } from '@/server/services/agentRuntime';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
@@ -67,7 +68,8 @@ import { createHistoryMessagesLoader, prepareOperation } from './pipeline/operat
 import { resolveRunAgentConfig } from './pipeline/resolveRunAgentConfig';
 import { startOperation } from './pipeline/startOperation';
 import { discoverTools } from './pipeline/toolDiscovery';
-import { setupTurn } from './pipeline/turnSetup';
+import { resolveNewTopicSnapshot, setupTurn } from './pipeline/turnSetup';
+import { createRunFacts, type RunFacts } from './runFacts';
 import { applyShareGateToAgentConfig } from './shareGate';
 import type { SubAgentRunDeps } from './subAgentRuns';
 import { execAgentMember, execAgentThreadRun } from './subAgentRuns';
@@ -203,17 +205,17 @@ export class AiAgentService {
     };
   }
 
-  private async getMarketService(): Promise<MarketService> {
+  private async getMarketService(runFacts?: RunFacts): Promise<MarketService> {
     if (this._marketService) return this._marketService;
 
-    let accessToken: string | undefined;
-    try {
-      const userModel = new UserModel(this.db, this.userId);
-      const settings = await userModel.getUserSettings();
-      accessToken = (settings?.market as any)?.accessToken;
-    } catch {
-      // non-fatal — MarketService will fall back to trustedClientToken
-    }
+    // The turn's fact reader already holds this row when a run is underway
+    // (`execAgent` asks it for the memory / timezone settings too); callers
+    // outside a run read it themselves.
+    // Non-fatal either way — MarketService falls back to trustedClientToken.
+    const settings = await (
+      runFacts ? runFacts.userSettings() : new UserModel(this.db, this.userId).getUserSettings()
+    ).catch(() => undefined);
+    const accessToken = (settings?.market as any)?.accessToken;
 
     this._marketService = new MarketService({
       accessToken,
@@ -302,6 +304,21 @@ export class AiAgentService {
     return this.agentRuntimeService.executeStep(params);
   }
 
+  /** Mint a lock owner that spans a whole inline step loop. */
+  createOperationLockOwner(operationId: string): string {
+    return this.agentRuntimeService.createOperationLockOwner(operationId);
+  }
+
+  /** Publish a step that an inline loop deferred instead of running. */
+  scheduleContinuation(continuation: AgentStepContinuation): Promise<void> {
+    return this.agentRuntimeService.scheduleContinuation(continuation);
+  }
+
+  /** Release a lock retained across an inline step loop. */
+  releaseOperationLock(operationId: string, stepLockOwner: string): Promise<void> {
+    return this.agentRuntimeService.releaseOperationLock(operationId, stepLockOwner);
+  }
+
   /**
    * Run the sub-agent completion bridge against this service's runtime.
    *
@@ -352,6 +369,28 @@ export class AiAgentService {
     return agentConfig;
   }
 
+  /** Resolve caller model policy before a pre-created topic permanently pins its model. */
+  private async resolvePrecreatedTopicConfig(
+    identifier: string,
+    overrides?: { model?: string; provider?: string },
+  ) {
+    const { agentConfig } = await resolveRunAgentConfig(
+      {
+        db: this.db,
+        resolveAgentConfigOrThrow: (id) => this.resolveAgentConfigOrThrow(id),
+        userId: this.userId,
+        workspaceId: this.workspaceId,
+      },
+      {
+        identifier,
+        modelOverride: overrides?.model,
+        providerOverride: overrides?.provider,
+        throwIfExecutionAborted: async () => {},
+      },
+    );
+    return agentConfig;
+  }
+
   /**
    * Defer an agent run to a future time ("send this in 3 hours").
    *
@@ -377,11 +416,20 @@ export class AiAgentService {
       throw new TRPCError({ code: 'BAD_REQUEST', message: 'runAt must be in the future' });
     }
 
-    const agentConfig = await this.resolveAgentConfigOrThrow(agentId || slug!);
+    const agentConfig = await this.resolvePrecreatedTopicConfig(agentId || slug!, {
+      model,
+      provider,
+    });
     const resolvedAgentId = agentConfig.id;
 
     const titleSource = markdownToTxt(prompt);
+    const snapshot = await resolveNewTopicSnapshot(
+      { db: this.db, userId: this.userId, workspaceId: this.workspaceId },
+      agentConfig,
+      { model, provider },
+    );
     const topic = await this.topicModel.create({
+      ...snapshot,
       agentId: resolvedAgentId,
       groupId,
       // A scheduled run is still an ordinary user chat, just deferred — so it
@@ -623,6 +671,7 @@ export class AiAgentService {
       appContext,
       autoStart = true,
       botContext,
+      botSender,
       createdThreadId,
       clientIp,
       userAgent,
@@ -642,6 +691,7 @@ export class AiAgentService {
       provider: providerOverride,
       stream,
       title,
+      steer,
       trigger,
       cronJobId,
       taskId,
@@ -786,6 +836,7 @@ export class AiAgentService {
         instructions,
         modelOverride,
         providerOverride,
+        shareVisitorUserId: shareGate?.visitorUserId,
         throwIfExecutionAborted,
         toolModeOverride,
       },
@@ -938,6 +989,7 @@ export class AiAgentService {
         attachedFileIds,
         batchApprovalAnchorId,
         botContext,
+        botSender,
         clientIds,
         continuationAssistantId,
         conversationAgentId,
@@ -954,6 +1006,7 @@ export class AiAgentService {
         resume,
         runFromHistory,
         shareGate,
+        steer,
         throwIfExecutionAborted,
         title,
         trigger,
@@ -976,6 +1029,14 @@ export class AiAgentService {
     // (`pipeline/*`). Built after the turn rows exist so every stage sees the
     // persisted anchors; `agentConfig` stays the same mutable object so stage
     // systemRole appends remain visible to `createOperation` below.
+    // One reader for the facts that cannot change within this turn, so the
+    // send window asks the routed device and the user's row once each.
+    const runFacts = createRunFacts({
+      db: this.db,
+      userId: this.userId,
+      workspaceId: this.workspaceId,
+    });
+
     const runContext: ExecRunContext = {
       agentConfig,
       appContext,
@@ -988,6 +1049,7 @@ export class AiAgentService {
       prompt,
       provider,
       resolvedAgentId,
+      runFacts,
       shareGate,
       topicId,
       trigger,
@@ -999,7 +1061,7 @@ export class AiAgentService {
         {
           bindTopicWorkingDirectory: (p) => this.bindTopicWorkingDirectory(p),
           db: this.db,
-          getMarketService: () => this.getMarketService(),
+          getMarketService: () => this.getMarketService(runFacts),
           messageModel: this.messageModel,
           resolveDeviceWorkspaceId: (deviceId) => this.resolveDeviceWorkspaceId(deviceId),
           topicModel: this.topicModel,
@@ -1037,8 +1099,7 @@ export class AiAgentService {
     let enableExpertise = false;
     let userTimezone: string | undefined;
     try {
-      const userModel = new UserModel(this.db, this.userId);
-      const settings = await userModel.getUserSettings();
+      const settings = await runFacts.userSettings();
       const memorySettings = settings?.memory as { enabled?: boolean } | undefined;
 
       globalMemoryEnabled = agentMemoryEnabled ?? memorySettings?.enabled !== false;
@@ -1050,10 +1111,7 @@ export class AiAgentService {
       // `allowReadMemory`), but the timezone has no such gate and must not
       // leak the creator's own setting into a visitor's turn.
       if (shareGate) {
-        const visitorSettings = await new UserModel(
-          this.db,
-          shareGate.visitorUserId,
-        ).getUserSettings();
+        const visitorSettings = await runFacts.userSettings(shareGate.visitorUserId);
         const visitorGeneralSettings = visitorSettings?.general as
           { timezone?: string } | undefined;
         userTimezone = visitorGeneralSettings?.timezone;
@@ -1119,7 +1177,7 @@ export class AiAgentService {
         connectorModel: this.connectorModel,
         connectorToolModel: this.connectorToolModel,
         db: this.db,
-        getMarketService: () => this.getMarketService(),
+        getMarketService: () => this.getMarketService(runFacts),
         messageModel: this.messageModel,
         pluginModel: this.pluginModel,
         userId: this.userId,
@@ -1275,6 +1333,7 @@ export class AiAgentService {
         botContext,
         botPlatformContext,
         clientIp,
+        disabledPluginIds,
         discordContext,
         discovery,
         enableExpertise,
@@ -1293,6 +1352,7 @@ export class AiAgentService {
         queueRetryDelay,
         signal,
         stream,
+        includeFinalState: params.includeFinalState,
         topicStartOwnerOperationId: params.topicStartOwnerOperationId,
         updateAbortedAssistantMessage,
         userAgent,
@@ -1334,7 +1394,13 @@ export class AiAgentService {
       const topicTitle =
         newTopic?.title ||
         fallbackTitleSource.slice(0, 50) + (fallbackTitleSource.length > 50 ? '...' : '');
+      const agentConfig = await this.resolvePrecreatedTopicConfig(agentId);
+      const snapshot = await resolveNewTopicSnapshot(
+        { db: this.db, userId: this.userId, workspaceId: this.workspaceId },
+        agentConfig,
+      );
       const topicItem = await this.topicModel.create({
+        ...snapshot,
         agentId,
         groupId,
         messages: newTopic?.topicMessageIds,
@@ -1518,6 +1584,17 @@ export class AiAgentService {
     threadId?: string;
   }> {
     return this.interventionController.interruptTask(params);
+  }
+
+  /**
+   * Flags whether the composer still holds user messages queued behind a run.
+   * Delegates to {@link InterventionController}.
+   */
+  async setQueuedMessages(params: {
+    operationId: string;
+    pending: boolean;
+  }): Promise<{ success: boolean }> {
+    return this.interventionController.setQueuedMessages(params);
   }
 
   /** Settle a parked approval batch and terminate its operation. */

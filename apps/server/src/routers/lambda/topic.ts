@@ -1,6 +1,7 @@
 import { PERMISSION_ACTIONS } from '@lobechat/const/rbac';
 import {
   canPublishAgentTopicLink,
+  chatTopicCreateMetadataSchema,
   chatTopicMetadataUpdateSchema,
   chatTopicStatusSchema,
   type HeteroSessionImportPayload,
@@ -247,6 +248,22 @@ const recordTopicShareAudit = async (
 };
 
 export const topicRouter = router({
+  cancelRateLimitContinuation: topicProcedure
+    .use(withScopedPermission('topic:update'))
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      await assertCanUseTopicTargets(guardCtx(ctx), [input.id]);
+      await assertCreatorTopicTargets(guardCtx(ctx), [input.id]);
+      const result = await ctx.topicModel.cancelRateLimitContinuation(input.id);
+      if (result.status === 'busy')
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: 'The source continuation has already been claimed or started.',
+        });
+      if (result.status === 'unchanged') return null;
+      return { metadata: result.metadata };
+    }),
+
   getTopicDetail: topicProcedure
     .input(z.object({ id: z.string() }))
     .query(async ({ input, ctx }) => {
@@ -496,6 +513,9 @@ export const topicRouter = router({
           favorite: z.boolean().optional(),
           groupId: z.string().nullish(),
           messages: z.array(z.string()).optional(),
+          // The pinned reasoning snapshot taken next to the pinned model
+          // (`snapshotAgentReasoning`); other metadata keys are server-owned.
+          metadata: chatTopicCreateMetadataSchema.optional(),
           // The topic's pinned model snapshot, persisted to the top-level
           // `topics.model`/`provider` columns (config source of truth).
           model: z.string().optional(),
@@ -1067,6 +1087,28 @@ export const topicRouter = router({
       }
 
       return ctx.topicModel.update(input.id, { ...restValue, sessionId: resolvedSessionId });
+    }),
+
+  /**
+   * Switch the topic's pinned model and its effort pin atomically — see
+   * `TopicModel.updateModelPin`. Same co-editing rules as `updateTopic`.
+   */
+  updateTopicModel: topicProcedure
+    .use(withScopedPermission('topic:update'))
+    .input(
+      z.object({
+        id: z.string(),
+        metadata: chatTopicCreateMetadataSchema.optional(),
+        model: z.string(),
+        provider: z.string(),
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      await assertCanUseTopicTargets(guardCtx(ctx), [input.id]);
+      await assertCreatorTopicTargets(guardCtx(ctx), [input.id]);
+
+      const { id, ...value } = input;
+      return ctx.topicModel.updateModelPin(id, value);
     }),
 
   updateTopicMetadata: topicProcedure

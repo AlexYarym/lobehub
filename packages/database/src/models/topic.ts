@@ -7,6 +7,7 @@ import type {
   TopicRankItem,
   TopicScheduledRun,
 } from '@lobechat/types';
+import { parseTopicScheduledRun } from '@lobechat/types';
 import type { TimingSink } from '@lobechat/utils';
 import {
   getDurationMs,
@@ -34,11 +35,14 @@ import {
   sql,
 } from 'drizzle-orm';
 
+import { clampToolIdentifier } from '@/utils/clampToolIdentifier';
+
 import type { FtsSearchCandidateSource } from '../repositories/ftsSearch';
 import type { TopicItem } from '../schemas';
 import {
   agentOperations,
   agents,
+  chatGroups,
   messagePlugins,
   messages,
   threads,
@@ -52,11 +56,14 @@ import { markCopiedMessageMetadata } from '../utils/copyMessagesInDatabase';
 import { genEndDateWhere, genRangeWhere, genStartDateWhere, genWhere } from '../utils/genWhere';
 import { idGenerator } from '../utils/idGenerator';
 import { inJsonStringArray } from '../utils/inJsonStringArray';
+import { searchableMessage } from '../utils/searchableMessage';
 import { notShareVisitorTopic } from '../utils/shareVisitor';
 import { buildWorkspacePayload, buildWorkspaceWhere } from '../utils/workspace';
 import { recomputeTopicUsage } from './topicUsage';
 
 type OnboardingSessionMetadataPatch = Partial<NonNullable<ChatTopicMetadata['onboardingSession']>>;
+type RunningOperation = NonNullable<ChatTopicMetadata['runningOperation']>;
+type RunningOperationPatch = Omit<Partial<RunningOperation>, 'childOperations' | 'operationId'>;
 type TopicMetadataPatch = Omit<Partial<ChatTopicMetadata>, 'onboardingSession'> & {
   onboardingSession?: OnboardingSessionMetadataPatch;
 };
@@ -99,6 +106,12 @@ const UNBOUNDED_OPERATION_STATUSES = new Set(['waiting_for_human', 'waiting_for_
 export interface TopicListItem extends TopicItem {
   /** The topic's last non-empty assistant reply, truncated with a trailing `…`. Only set when `queryTopics` is called with `withLastMessage`. */
   lastAssistantMessage?: string | null;
+  /**
+   * Visibility of the agent/group this topic belongs to — `'private'` marks a
+   * conversation that must stay out of shared/team listings even though the
+   * viewer may own it. Null for legacy rows with no resolvable parent.
+   */
+  parentVisibility?: 'private' | 'public' | null;
   /**
    * When the topic's current run started (`agent_operations.startedAt` of its
    * latest top-level running operation). Only computed for `running` topics;
@@ -902,13 +915,37 @@ export class TopicModel {
     statuses?: string[];
     withLastMessage?: boolean;
   } = {}): Promise<TopicListItem[]> => {
+    const scope = { userId: this.userId, workspaceId: this.workspaceId };
+
+    // Unlike the per-agent topic list, this feed is not scoped by agent at all:
+    // in a workspace `ownership()` matches every member's rows, so a topic
+    // whose owning agent/group is someone else's PRIVATE conversation would
+    // surface here — title and last assistant reply included. Gate on the
+    // parent the same way the Recent feed does. Rows with no resolvable parent
+    // (legacy session-only topics) have nothing to check and keep the previous
+    // behaviour.
+    const visibleParentWhere = or(
+      and(isNull(topics.agentId), isNull(topics.groupId)),
+      and(isNotNull(topics.groupId), buildWorkspaceWhere(scope, chatGroups)),
+      and(isNull(topics.groupId), isNotNull(topics.agentId), buildWorkspaceWhere(scope, agents)),
+    );
+
     const where = and(
       this.ownership(),
       this.notShareVisitor(),
+      visibleParentWhere,
       statuses && statuses.length > 0
         ? inArray(topics.status, statuses as ChatTopicStatus[])
         : undefined,
     );
+
+    // `buildWorkspaceWhere` keeps a member's OWN private rows visible, which is
+    // right for a "mine" list and wrong for a shared one. Ship the parent's
+    // visibility so the caller's team view can drop private conversations
+    // without a second round trip.
+    const parentVisibilityColumn = sql<
+      'private' | 'public' | null
+    >`COALESCE(${chatGroups.visibility}, ${agents.visibility})`.as('parent_visibility');
 
     // When the topic's current run started, so a list can show live elapsed
     // time instead of `updatedAt` (which moves on every message write). The
@@ -942,9 +979,12 @@ export class TopicModel {
       return this.db
         .select({
           ...getTableColumns(topics),
+          parentVisibility: parentVisibilityColumn,
           runStartedAt: runStartedAtColumn,
         })
         .from(topics)
+        .leftJoin(agents, eq(topics.agentId, agents.id))
+        .leftJoin(chatGroups, eq(topics.groupId, chatGroups.id))
         .where(where)
         .orderBy(desc(topics.updatedAt))
         .limit(pageSize);
@@ -980,9 +1020,12 @@ export class TopicModel {
         lastAssistantMessage: sql<string | null>`(${lastAssistantMessageSubquery})`.as(
           'last_assistant_message',
         ),
+        parentVisibility: parentVisibilityColumn,
         runStartedAt: runStartedAtColumn,
       })
       .from(topics)
+      .leftJoin(agents, eq(topics.agentId, agents.id))
+      .leftJoin(chatGroups, eq(topics.groupId, chatGroups.id))
       .where(where)
       .orderBy(desc(topics.updatedAt))
       .limit(pageSize);
@@ -1080,6 +1123,7 @@ export class TopicModel {
         .where(
           and(
             this.messageOwnership(),
+            searchableMessage(),
             messageCandidateIds
               ? inJsonStringArray(messages.id, messageCandidateIds)
               : sql`${messages.content} @@@ ${bm25Query}`,
@@ -1540,8 +1584,10 @@ export class TopicModel {
 
           await tx.insert(messagePlugins).values({
             ...plugin,
+            apiName: clampToolIdentifier(plugin.apiName),
             clientId: null,
             id: newId,
+            identifier: clampToolIdentifier(plugin.identifier),
             toolCallId: newToolCallId,
           });
         }
@@ -1670,9 +1716,26 @@ export class TopicModel {
   // **************** Update *************** //
 
   update = async (id: string, data: Partial<TopicItem>) => {
+    /**
+     * Older clients switch models through the general update endpoint. Clear
+     * the old model's reasoning pin in the same statement, comparing against
+     * the persisted row so partial writes and concurrent switches stay safe.
+     * Explicit metadata remains the caller's replacement snapshot.
+     */
+    const modelChanged = or(
+      data.model !== undefined ? sql`${topics.model} is distinct from ${data.model}` : undefined,
+      data.provider !== undefined
+        ? sql`${topics.provider} is distinct from ${data.provider}`
+        : undefined,
+    );
+    const metadata =
+      data.metadata === undefined && modelChanged
+        ? sql`case when ${modelChanged} then coalesce(${topics.metadata}, '{}'::jsonb) - 'reasoningConfig' else ${topics.metadata} end`
+        : data.metadata;
+
     return this.db
       .update(topics)
-      .set({ ...data, updatedAt: new Date() })
+      .set({ ...data, metadata, updatedAt: new Date() })
       .where(and(eq(topics.id, id), this.ownership()))
       .returning();
   };
@@ -1911,10 +1974,55 @@ export class TopicModel {
     });
   };
 
+  /**
+   * Switch a topic's pinned model together with its model-scoped effort pin
+   * (`metadata.reasoningConfig` / `metadata.heteroEffort`) in one row-locked
+   * statement, so neither a concurrent switch nor an in-flight run can observe
+   * the new model paired with the previous model's pin. `reasoningConfig` is
+   * model-keyed and therefore always replaced (dropped when not provided);
+   * `heteroEffort` is only touched when given.
+   */
+  updateModelPin = async (
+    id: string,
+    {
+      metadata,
+      model,
+      provider,
+    }: {
+      metadata?: Pick<ChatTopicMetadata, 'heteroEffort' | 'reasoningConfig'>;
+      model: string;
+      provider: string;
+    },
+  ) =>
+    this.db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ metadata: topics.metadata })
+        .from(topics)
+        .where(and(eq(topics.id, id), this.ownership()))
+        .for('update');
+
+      if (!existing) return [];
+
+      const { reasoningConfig: _stale, ...rest } = existing.metadata ?? {};
+      const mergedMetadata: ChatTopicMetadata = {
+        ...rest,
+        ...(metadata?.heteroEffort !== undefined && { heteroEffort: metadata.heteroEffort }),
+        ...(metadata?.reasoningConfig !== undefined && {
+          reasoningConfig: metadata.reasoningConfig,
+        }),
+      };
+
+      return tx
+        .update(topics)
+        .set({ metadata: mergedMetadata, model, provider, updatedAt: new Date() })
+        .where(and(eq(topics.id, id), this.ownership()))
+        .returning();
+    });
+
   appendRunningOperationChild = async (
     id: string,
     parentOperationId: string,
-    child: NonNullable<ChatTopicMetadata['runningOperation']>,
+    child: RunningOperation,
   ): Promise<boolean> =>
     this.db.transaction(async (tx) => {
       const [existing] = await tx
@@ -1940,6 +2048,43 @@ export class TopicModel {
               ],
             },
           },
+        })
+        .where(and(eq(topics.id, id), this.ownership()));
+      return true;
+    });
+
+  patchRunningOperation = async (
+    id: string,
+    operationId: string,
+    patch: RunningOperationPatch,
+  ): Promise<boolean> =>
+    this.db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ metadata: topics.metadata })
+        .from(topics)
+        .where(and(eq(topics.id, id), this.ownership()))
+        .for('update');
+      const runningOperation = existing?.metadata?.runningOperation;
+      if (!existing || !runningOperation) return false;
+
+      let nextRunningOperation: RunningOperation;
+      if (runningOperation.operationId === operationId) {
+        nextRunningOperation = { ...runningOperation, ...patch };
+      } else {
+        let matched = false;
+        const childOperations = runningOperation.childOperations?.map((child) => {
+          if (child.operationId !== operationId) return child;
+          matched = true;
+          return { ...child, ...patch };
+        });
+        if (!matched) return false;
+        nextRunningOperation = { ...runningOperation, childOperations };
+      }
+
+      await tx
+        .update(topics)
+        .set({
+          metadata: { ...existing.metadata, runningOperation: nextRunningOperation },
         })
         .where(and(eq(topics.id, id), this.ownership()));
       return true;
@@ -2072,6 +2217,10 @@ export class TopicModel {
    * Whether the run a `runningOperation` marker points at is still the topic's
    * legitimate owner.
    *
+   * Public so the gateway-token refresh routers can refuse to reconnect a
+   * client to a marker whose run has already ended (the marker is cleared
+   * best-effort, so a stale one must not be taken at face value).
+   *
    * The marker itself cannot answer this — it carries no heartbeat and is
    * cleared best-effort — so the authority is the operation row, which both the
    * in-process runtime (`createOperation`) and the heterogeneous path
@@ -2082,7 +2231,7 @@ export class TopicModel {
    * with a marker and no row. A marker with neither a row nor a stamp cannot be
    * proven live and must not keep an already-stuck topic stuck.
    */
-  private isRunningOperationAlive = async (
+  isRunningOperationAlive = async (
     tx: Pick<LobeChatDatabase, 'select'>,
     runningOperation: NonNullable<ChatTopicMetadata['runningOperation']>,
   ): Promise<boolean> => {
@@ -2319,6 +2468,31 @@ export class TopicModel {
         })
         .where(and(eq(topics.id, id), this.ownership()));
       return 'released';
+    });
+
+  /** Atomically cancel an unclaimed rate-limit run, serialized with the dispatcher. */
+  cancelRateLimitContinuation = async (id: string) =>
+    this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .select({ metadata: topics.metadata, status: topics.status })
+        .from(topics)
+        .where(and(eq(topics.id, id), this.ownership()))
+        .for('update');
+      if (!row) return { status: 'unchanged' as const };
+      if (row.status === 'running') return { status: 'busy' as const };
+      const scheduledRun = parseTopicScheduledRun(row.metadata?.scheduledRun);
+      if (row.status !== 'scheduled' || scheduledRun?.kind !== 'resume_after_rate_limit')
+        return { status: 'unchanged' as const };
+      // A lease expiring does not stop its dispatcher. Once claimed, a handoff
+      // must not race that worker, even if its five-minute lease has elapsed.
+      if (scheduledRun.claim) return { status: 'busy' as const };
+
+      const metadata = { ...row.metadata, scheduledRun: null };
+      await tx
+        .update(topics)
+        .set({ metadata, status: 'failed' })
+        .where(and(eq(topics.id, id), this.ownership()));
+      return { metadata, status: 'cancelled' as const };
     });
 
   /**

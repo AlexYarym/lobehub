@@ -7,6 +7,7 @@ import type {
   ReviewAdjudication,
   ReviewProposalEdit,
   VerifierType,
+  VerifyCheckDefinition,
   VerifyCheckItem,
   VerifyEvidence,
   VerifyOnFailStrategy,
@@ -37,6 +38,10 @@ export type AcceptanceListItem = Awaited<
 
 export type AcceptanceListPage = Awaited<ReturnType<typeof lambdaClient.acceptance.listPage.query>>;
 
+export type AcceptancePurgePreview = Awaited<
+  ReturnType<typeof lambdaClient.acceptance.purgePreview.query>
+>;
+
 /** The list's status split, shared by the flat and paged reads. */
 export type AcceptanceListFilter = 'active' | 'all' | 'completed';
 
@@ -45,10 +50,13 @@ export type AcceptanceStatusOverride = 'accepted' | 'closed' | 'delivered' | 're
 
 /** Editable fields of a single delivery-check criterion. */
 export interface UpdateCriterionValue {
+  archivedAt?: Date | null;
+  definition?: VerifyCheckDefinition | null;
   description?: string | null;
   documentId?: string | null;
   onFail?: VerifyOnFailStrategy;
   required?: boolean;
+  tags?: string[];
   title?: string;
   verifierConfig?: Record<string, unknown>;
   verifierType?: VerifierType;
@@ -56,9 +64,12 @@ export interface UpdateCriterionValue {
 
 /** Fields for authoring a new delivery-check criterion. */
 export interface CreateCriterionInput {
+  definition?: VerifyCheckDefinition;
+  description?: string;
   documentId?: string;
   onFail?: VerifyOnFailStrategy;
   required?: boolean;
+  tags?: string[];
   title: string;
   verifierConfig?: Record<string, unknown>;
   verifierType: VerifierType;
@@ -156,6 +167,12 @@ export interface GenerateDraftPlanInput {
 
 /** Client wrapper around the `verify` lambda router. */
 export class VerifyService {
+  startFlow = (input: Parameters<typeof lambdaClient.acceptance.startFlow.mutate>[0]) =>
+    lambdaClient.acceptance.startFlow.mutate(input);
+
+  reviewFlowStep = (input: Parameters<typeof lambdaClient.acceptance.reviewFlowStep.mutate>[0]) =>
+    lambdaClient.acceptance.reviewFlowStep.mutate(input);
+
   // ---- subject-level acceptance ----
   getAcceptanceBundle = (id: string): Promise<AcceptanceBundle> =>
     lambdaClient.acceptance.getBundle.query({ id });
@@ -330,11 +347,16 @@ export class VerifyService {
   mergeAcceptance = (sourceId: string, targetId: string) =>
     lambdaClient.acceptance.merge.mutate({ sourceId, targetId });
 
-  /** Delete the acceptance aggregate (its round reports detach, not delete). */
-  deleteAcceptance = (id: string) => lambdaClient.acceptance.remove.mutate({ id });
+  getAcceptancePurgePreview = (ids: string[]) =>
+    lambdaClient.acceptance.purgePreview.query({ ids });
+
+  /** Delete the acceptance aggregate; its round reports detach unless `purge` removes them too. */
+  deleteAcceptance = (id: string, purge?: boolean) =>
+    lambdaClient.acceptance.remove.mutate({ id, purge });
 
   /** Batch twin of `deleteAcceptance` for the list's multi-selection. */
-  deleteAcceptanceBatch = (ids: string[]) => lambdaClient.acceptance.removeBatch.mutate({ ids });
+  deleteAcceptanceBatch = (ids: string[], purge?: boolean) =>
+    lambdaClient.acceptance.removeBatch.mutate({ ids, purge });
 
   // ---- per-run plan ----
   getVerifyState = (operationId: string): Promise<VerifyStateResponse | null> =>

@@ -21,7 +21,7 @@ const mockService = vi.hoisted(() => ({
 const effectiveAgencyConfig = vi.hoisted(() => ({
   current: {
     boundDeviceId: 'personal-device' as string | undefined,
-    executionTarget: 'local' as const,
+    executionTarget: 'local' as 'local' | 'device',
     heterogeneousProvider: {
       command: 'codex',
       type: 'codex',
@@ -29,7 +29,6 @@ const effectiveAgencyConfig = vi.hoisted(() => ({
   },
   workspaceScoped: false,
 }));
-const labPreferences = vi.hoisted(() => ({ enableAgentProviderBinding: true }));
 
 vi.mock('@lobechat/const', async (importOriginal) => ({
   ...(await importOriginal<typeof LobechatConstModule>()),
@@ -88,19 +87,6 @@ vi.mock('@/store/agent/selectors', () => ({
   },
 }));
 
-vi.mock('@/store/user', () => ({
-  useUserStore: (selector: (state: Record<string, unknown>) => unknown) =>
-    selector({ preference: { lab: labPreferences } }),
-}));
-
-vi.mock('@/store/user/selectors', () => ({
-  labPreferSelectors: {
-    enableAgentProviderBinding: (state: {
-      preference: { lab: { enableAgentProviderBinding: boolean } };
-    }) => state.preference.lab.enableAgentProviderBinding,
-  },
-}));
-
 const { confirmModalMock, toastErrorMock, toastSuccessMock } = vi.hoisted(() => ({
   confirmModalMock: vi.fn(),
   toastErrorMock: vi.fn(),
@@ -118,10 +104,17 @@ vi.mock('@/services/electron/heterogeneousAgent', () => ({
 
 // A `deviceId` routes the live sample through the device gateway TRPC instead
 // of Electron IPC (see `fetchClaudeCodeQuotaSnapshot`).
-const mockLambdaDeviceQuota = vi.hoisted(() => vi.fn());
+const { mockLambdaClaudeQuota, mockLambdaCodexQuota } = vi.hoisted(() => ({
+  mockLambdaClaudeQuota: vi.fn(),
+  mockLambdaCodexQuota: vi.fn(),
+}));
 
 vi.mock('@/libs/trpc/client', () => ({
-  lambdaClient: { device: { getClaudeCodeQuota: { query: mockLambdaDeviceQuota } } },
+  lambdaClient: {
+    device: {
+      getClaudeCodeQuota: { query: mockLambdaClaudeQuota },
+    },
+  },
 }));
 
 // The menu reads persisted quota through TRPC before falling back to the live
@@ -131,6 +124,8 @@ vi.mock('@/libs/trpc/client', () => ({
 const mockQuotaService = vi.hoisted(() => ({
   getLatestReadings: vi.fn(async (): Promise<unknown[]> => []),
   ingestClaudeSnapshot: vi.fn(async () => undefined),
+  ingestCodexSnapshot: vi.fn(async () => undefined),
+  refreshCodexQuota: vi.fn(),
   listAccounts: vi.fn(async (): Promise<unknown[]> => []),
   listBindings: vi.fn(async (): Promise<unknown[]> => []),
 }));
@@ -146,8 +141,6 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('@lobehub/ui', async (importOriginal) => {
-  const { useState } = await import('react');
-
   return {
     ...(await importOriginal<object>()),
     ActionIcon: ({
@@ -167,36 +160,6 @@ vi.mock('@lobehub/ui', async (importOriginal) => {
         onClick={onClick}
       />
     ),
-    Collapse: ({
-      defaultActiveKey = [],
-      items,
-    }: {
-      defaultActiveKey?: string[];
-      items: { children?: ReactNode; key: string; label?: ReactNode }[];
-    }) => {
-      const [activeKeys, setActiveKeys] = useState(defaultActiveKey);
-
-      return (
-        <div>
-          {items.map((item) => {
-            const expanded = activeKeys.includes(item.key);
-
-            return (
-              <div key={item.key}>
-                <button
-                  aria-expanded={expanded}
-                  type="button"
-                  onClick={() => setActiveKeys(expanded ? [] : [item.key])}
-                >
-                  {item.label}
-                </button>
-                {expanded && item.children}
-              </div>
-            );
-          })}
-        </div>
-      );
-    },
     Flexbox: ({ children, className }: { children?: ReactNode; className?: string }) => (
       <div className={className}>{children}</div>
     ),
@@ -313,11 +276,13 @@ beforeEach(() => {
     heterogeneousProvider: { command: 'codex', type: 'codex' },
   };
   effectiveAgencyConfig.workspaceScoped = false;
-  labPreferences.enableAgentProviderBinding = true;
   confirmModalMock.mockReset();
   mockService.consumeCodexRateLimitResetCredit.mockReset();
   mockService.getClaudeCodeQuota.mockReset();
   mockService.getCodexQuota.mockReset();
+  mockLambdaClaudeQuota.mockReset();
+  mockLambdaCodexQuota.mockReset();
+  mockQuotaService.refreshCodexQuota.mockImplementation(mockLambdaCodexQuota);
   toastErrorMock.mockReset();
   toastSuccessMock.mockReset();
   mockQuotaService.getLatestReadings.mockResolvedValue([]);
@@ -341,17 +306,50 @@ describe('HeteroControlBar', () => {
     expect(mockService.getCodexQuota).toHaveBeenCalledWith({ command: 'codex', env: undefined });
   });
 
-  it('does not show local quota for a workspace shared-local fallback without an override', () => {
+  it('shows Codex quota sampled by a bound remote device', async () => {
+    effectiveAgencyConfig.current = {
+      boundDeviceId: 'remote-device',
+      executionTarget: 'device',
+      heterogeneousProvider: { command: 'codex', type: 'codex' },
+    };
+    mockLambdaCodexQuota.mockResolvedValue(
+      codexSnapshot({ session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 } }),
+    );
+
+    render(<HeteroControlBar />);
+
+    expect(
+      await screen.findByRole('button', { name: 'heteroAgent.codexQuota.tooltip' }),
+    ).toBeTruthy();
+    expect(mockLambdaCodexQuota).toHaveBeenCalledWith({
+      command: 'codex',
+      deviceId: 'remote-device',
+      env: undefined,
+    });
+    expect(mockService.getCodexQuota).not.toHaveBeenCalled();
+  });
+
+  it('shows remote quota for a workspace shared-device fallback', async () => {
     effectiveAgencyConfig.current = {
       boundDeviceId: 'workspace-device',
       executionTarget: 'local',
       heterogeneousProvider: { command: 'codex', type: 'codex' },
     };
     effectiveAgencyConfig.workspaceScoped = true;
+    mockLambdaCodexQuota.mockResolvedValue(
+      codexSnapshot({ session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 } }),
+    );
 
     render(<HeteroControlBar />);
 
-    expect(screen.queryByRole('button', { name: 'heteroAgent.codexQuota.tooltip' })).toBeNull();
+    expect(
+      await screen.findByRole('button', { name: 'heteroAgent.codexQuota.tooltip' }),
+    ).toBeTruthy();
+    expect(mockLambdaCodexQuota).toHaveBeenCalledWith({
+      command: 'codex',
+      deviceId: 'workspace-device',
+      env: undefined,
+    });
     expect(mockService.getCodexQuota).not.toHaveBeenCalled();
   });
 
@@ -381,21 +379,6 @@ describe('HeteroControlBar', () => {
     expect(screen.getByTestId('api-credits')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'heteroAgent.claudeQuota.tooltip' })).toBeNull();
     expect(mockService.getClaudeCodeQuota).not.toHaveBeenCalled();
-  });
-
-  it('hides platform credits when API mode is disabled in Labs', () => {
-    labPreferences.enableAgentProviderBinding = false;
-    effectiveAgencyConfig.current = {
-      boundDeviceId: 'personal-device',
-      executionTarget: 'local',
-      heterogeneousProvider: { authMode: 'api', command: 'codex', type: 'codex' },
-    };
-
-    render(<HeteroControlBar />);
-
-    expect(screen.queryByTestId('api-credits')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'heteroAgent.codexQuota.tooltip' })).toBeNull();
-    expect(mockService.getCodexQuota).not.toHaveBeenCalled();
   });
 });
 
@@ -860,14 +843,14 @@ describe('ClaudeCodeQuotaMenu', () => {
   });
 
   it('samples through the device gateway RPC when a deviceId is provided', async () => {
-    mockLambdaDeviceQuota.mockResolvedValue(
+    mockLambdaClaudeQuota.mockResolvedValue(
       claudeSnapshot({ session: { resetsAt: null, usedPercent: 8, windowMinutes: 300 } }),
     );
 
     render(<ClaudeCodeQuotaMenu deviceId="remote-device" />);
 
     await waitFor(() =>
-      expect(mockLambdaDeviceQuota).toHaveBeenCalledWith({
+      expect(mockLambdaClaudeQuota).toHaveBeenCalledWith({
         deviceId: 'remote-device',
         env: undefined,
       }),
@@ -881,7 +864,7 @@ describe('ClaudeCodeQuotaMenu', () => {
     const account = persistedAccount();
     mockQuotaService.listAccounts.mockResolvedValue([account]);
     mockQuotaService.getLatestReadings.mockResolvedValue([persistedSessionReading(capturedAt)]);
-    mockLambdaDeviceQuota.mockResolvedValueOnce(
+    mockLambdaClaudeQuota.mockResolvedValueOnce(
       claudeSnapshot({
         identity: { externalAccountId: 'ext-1' },
         readings: [liveSessionReading(capturedAt)],
@@ -891,11 +874,11 @@ describe('ClaudeCodeQuotaMenu', () => {
     const { rerender } = render(<ClaudeCodeQuotaMenu deviceId="device-a" />);
     expect(await screen.findByText('92%')).toBeTruthy();
 
-    mockLambdaDeviceQuota.mockResolvedValueOnce(null);
+    mockLambdaClaudeQuota.mockResolvedValueOnce(null);
     rerender(<ClaudeCodeQuotaMenu deviceId="device-b" />);
 
     await waitFor(() =>
-      expect(mockLambdaDeviceQuota).toHaveBeenLastCalledWith({
+      expect(mockLambdaClaudeQuota).toHaveBeenLastCalledWith({
         deviceId: 'device-b',
         env: undefined,
       }),
@@ -1045,7 +1028,6 @@ describe('CodexQuotaMenu', () => {
       screen.getAllByText((content) => content.startsWith('heteroAgent.quota.duration.')),
     ).toHaveLength(2);
     const resetCreditsSummary = screen.getByText('heteroAgent.codexQuota.resetCredits:4');
-    expect(resetCreditsSummary.closest('button')?.getAttribute('aria-expanded')).toBe('false');
     expect(screen.queryByText('#1')).toBeNull();
 
     fireEvent.click(resetCreditsSummary);

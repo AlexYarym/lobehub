@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import {
   CUSTOM_FOLDER_FILE_TYPE,
   DERIVED_DOCUMENT_SOURCE_TYPE,
@@ -7,6 +9,7 @@ import {
   UPLOAD_FILE_SIZE_LIMIT_ERROR_MESSAGE,
 } from '@lobechat/const';
 import { TRPCError } from '@trpc/server';
+import isEqual from 'fast-deep-equal';
 import pMap from 'p-map';
 import { z } from 'zod';
 
@@ -28,12 +31,20 @@ import { router } from '@/libs/trpc/lambda';
 import { serverDatabase } from '@/libs/trpc/lambda/middleware';
 import { DocumentService } from '@/server/services/document';
 import { FileService } from '@/server/services/file';
+import { downloadRemoteImage } from '@/server/services/file/downloadRemoteImage';
+import { FileUploadService } from '@/server/services/fileUpload';
 import { assertCanPerformResourceAction } from '@/server/services/resourcePermission';
 import { hasWorkspaceScopedPermission } from '@/server/services/workspacePermission';
 import { createResourceContentPreview } from '@/server/utils/resourceContentPreview';
 import { AsyncTaskStatus, AsyncTaskType, type IAsyncTaskError } from '@/types/asyncTask';
 import type { FileListItem, KnowledgeItemStatus } from '@/types/files';
-import { QueryFileListSchema, toFileSource, UploadFileSchema } from '@/types/files';
+import {
+  FileSource,
+  QueryFileListSchema,
+  stripAgentShareFileProvenance,
+  toFileSource,
+  UploadFileSchema,
+} from '@/types/files';
 import { TransferErrorCode } from '@/types/transferError';
 
 import {
@@ -194,6 +205,7 @@ const fileProcedure = wsCompatProcedure.use(serverDatabase).use(async (opts) => 
       documentService: new DocumentService(ctx.serverDB, ctx.userId, wsId),
       fileModel: new FileModel(ctx.serverDB, ctx.userId, wsId),
       fileService: new FileService(ctx.serverDB, ctx.userId, wsId),
+      fileUploadService: new FileUploadService(ctx.serverDB, ctx.userId, wsId),
       knowledgeBaseModel: new KnowledgeBaseModel(ctx.serverDB, ctx.userId, wsId),
       knowledgeRepo: new KnowledgeRepo(ctx.serverDB, ctx.userId, wsId),
     },
@@ -217,7 +229,6 @@ export const fileRouter = router({
 
   createFile: fileProcedure
     .use(withScopedPermission('file:upload'))
-    .use(checkFileStorageUsage)
     .input(
       UploadFileSchema.omit({ url: true }).extend({
         parentId: z.string().optional(),
@@ -226,8 +237,16 @@ export const fileRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
+      const metadata = stripAgentShareFileProvenance(input.metadata);
       const existingFile = await ctx.fileModel.checkHash(input.hash!);
       const { isExist } = existingFile;
+      const latestUpload = await ctx.fileUploadService.findLatest(input.url);
+      if (!latestUpload && (await ctx.fileUploadService.hasAnyLiveSession(input.url))) {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: 'Upload pathname belongs to another session',
+        });
+      }
 
       const parentDocument = input.parentId
         ? await resolveAccessibleParentDocument(ctx, input.parentId)
@@ -256,14 +275,68 @@ export const fileRouter = router({
         ? (knowledgeBaseVisibility ?? input.visibility ?? parentVisibility ?? 'private')
         : undefined;
 
-      let actualSize = input.size;
-      try {
-        const { contentLength } = await ctx.fileService.getFileMetadata(input.url);
-        if (contentLength >= 1) {
-          actualSize = contentLength;
+      if (latestUpload?.status === 'settled') {
+        const settledFile = latestUpload.fileId
+          ? await ctx.fileModel.findById(latestUpload.fileId)
+          : undefined;
+        const isRetry =
+          !!settledFile &&
+          !input.knowledgeBaseId &&
+          isExist &&
+          existingFile.url === input.url &&
+          settledFile.fileHash === input.hash &&
+          settledFile.fileType === input.fileType &&
+          settledFile.name === input.name &&
+          settledFile.parentId === (resolvedParentId ?? null) &&
+          settledFile.size === input.size &&
+          (settledFile.source ?? undefined) === toFileSource(input.source) &&
+          settledFile.url === input.url &&
+          (!ctx.workspaceId || settledFile.visibility === resolvedVisibility) &&
+          isEqual(settledFile.metadata, metadata ?? null);
+
+        if (isRetry) {
+          return {
+            id: settledFile.id,
+            url: await ctx.fileService.getFileAccessUrl(settledFile),
+          };
         }
-      } catch {
-        // If metadata fetch fails, use original size from input
+
+        // The same global object can be referenced by multiple logical files.
+        // A non-identical request is the normal dedup path, not a stale retry.
+      } else if (latestUpload && latestUpload.status !== 'active') {
+        throw new TRPCError({ code: 'CONFLICT', message: 'Upload session is no longer active' });
+      }
+
+      const activeUpload =
+        latestUpload?.status === 'active'
+          ? await ctx.fileUploadService.touchActive(input.url)
+          : undefined;
+      if (latestUpload?.status === 'active' && !activeUpload) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'Upload session is no longer active' });
+      }
+
+      let actualSize: number;
+      if (activeUpload) {
+        try {
+          const { contentLength } = await ctx.fileService.getFileMetadata(input.url);
+          actualSize = contentLength;
+        } catch {
+          await ctx.fileUploadService.releaseBestEffort(input.url);
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Uploaded file is unavailable' });
+        }
+
+        if (input.size !== activeUpload.size || actualSize !== activeUpload.size) {
+          await ctx.fileUploadService.releaseBestEffort(input.url);
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Uploaded file size mismatch' });
+        }
+      } else {
+        actualSize = input.size;
+        try {
+          const { contentLength } = await ctx.fileService.getFileMetadata(input.url);
+          if (contentLength >= 1) actualSize = contentLength;
+        } catch {
+          // Compatibility path for clients that uploaded before reservations were introduced.
+        }
       }
 
       if (actualSize < 0) {
@@ -286,16 +359,6 @@ export const fileRouter = router({
       }
 
       const { id } = await ctx.serverDB.transaction(async (trx) => {
-        await businessFileUploadCheck({
-          actualSize,
-          clientIp: ctx.clientIp ?? undefined,
-          inputSize: input.size,
-          transaction: trx,
-          url: input.url,
-          userId: ctx.userId,
-          workspaceId: ctx.workspaceId,
-        });
-
         let shouldRefreshGlobalFile = false;
         if (isExist && existingFile.url && existingFile.url !== input.url) {
           shouldRefreshGlobalFile = !(await isStoredObjectAvailable(
@@ -311,34 +374,67 @@ export const fileRouter = router({
           await ctx.fileModel.updateGlobalFile(
             input.hash!,
             {
-              metadata: input.metadata,
+              metadata,
               url: input.url,
             },
             trx,
           );
         }
 
-        return ctx.fileModel.create(
-          {
-            fileHash: input.hash,
-            fileType: input.fileType,
-            knowledgeBaseId: input.knowledgeBaseId,
-            metadata: input.metadata,
-            name: input.name,
-            parentId: resolvedParentId,
-            size: actualSize,
-            // Attribution the caller supplied (e.g. a page-editor paste). The
-            // wire type is a loose string for older clients, so unknown values
-            // are dropped rather than persisted — `source` drives the resource
-            // library's origin filter and its hidden-source exclusion.
-            source: toFileSource(input.source),
-            url: input.url,
-            ...(resolvedVisibility ? { visibility: resolvedVisibility } : {}),
-          },
-          // if the file is not exist in global file, create a new one
-          !isExist,
-          trx,
-        );
+        const createFile = () =>
+          ctx.fileModel.create(
+            {
+              fileHash: input.hash,
+              fileType: input.fileType,
+              knowledgeBaseId: input.knowledgeBaseId,
+              metadata,
+              name: input.name,
+              parentId: resolvedParentId,
+              size: actualSize,
+              // Attribution the caller supplied (e.g. a page-editor paste). The
+              // wire type is a loose string for older clients, so unknown values
+              // are dropped rather than persisted — `source` drives the resource
+              // library's origin filter and its hidden-source exclusion.
+              source: toFileSource(input.source),
+              url: input.url,
+              ...(resolvedVisibility ? { visibility: resolvedVisibility } : {}),
+            },
+            // if the file is not exist in global file, create a new one
+            !isExist,
+            trx,
+          );
+
+        if (activeUpload) {
+          const lockedUpload = await ctx.fileUploadService.model.findLatestByPathnameForUpdate(
+            input.url,
+            trx,
+          );
+          if (lockedUpload?.id !== activeUpload.id || lockedUpload.status !== 'active') {
+            throw new TRPCError({
+              code: 'CONFLICT',
+              message: 'Upload session is no longer active',
+            });
+          }
+
+          const file = await createFile();
+          const settled = await ctx.fileUploadService.model.settle(lockedUpload.id, file.id, trx);
+          if (!settled) {
+            throw new TRPCError({ code: 'CONFLICT', message: 'Upload could not be settled' });
+          }
+          return file;
+        }
+
+        await businessFileUploadCheck({
+          actualSize,
+          clientIp: ctx.clientIp ?? undefined,
+          inputSize: input.size,
+          transaction: trx,
+          url: input.url,
+          userId: ctx.userId,
+          workspaceId: ctx.workspaceId,
+        });
+
+        return createFile();
       });
 
       return { id, url: await ctx.fileService.getFileAccessUrl({ id, url: input.url }) };
@@ -772,6 +868,32 @@ export const fileRouter = router({
       return ctx.knowledgeRepo.queryRecent(limit, 'page', input?.visibility);
     }),
 
+  rehostImage: fileProcedure
+    .use(withScopedPermission('file:upload'))
+    .use(checkFileStorageUsage)
+    .input(z.object({ url: z.url() }))
+    .mutation(async ({ ctx, input }) => {
+      const { buffer, extension, mimeType } = await downloadRemoteImage(input.url);
+      const pathname = `images/${ctx.userId}/${randomUUID()}.${extension}`;
+      const result = await ctx.fileService.uploadFromBuffer(
+        buffer,
+        mimeType,
+        pathname,
+        (transaction) =>
+          businessFileUploadCheck({
+            actualSize: buffer.length,
+            clientIp: ctx.clientIp ?? undefined,
+            inputSize: buffer.length,
+            transaction,
+            url: pathname,
+            userId: ctx.userId,
+            workspaceId: ctx.workspaceId,
+          }),
+        { source: FileSource.PageEditor, visibility: 'private' },
+      );
+      return { fileId: result.fileId, url: result.url };
+    }),
+
   removeFile: fileProcedure
     .use(withScopedPermission('file:delete'))
     .input(z.object({ id: z.string() }))
@@ -780,7 +902,9 @@ export const fileRouter = router({
       if (!existing) throw new TRPCError({ code: 'NOT_FOUND', message: 'File not found' });
       await assertFileNotInRestrictedKnowledgeBase(ctx, input.id);
 
-      const file = await ctx.fileModel.delete(input.id, serverDBEnv.REMOVE_GLOBAL_FILE);
+      const file = await ctx.fileModel.delete(input.id, {
+        removeGlobalFile: serverDBEnv.REMOVE_GLOBAL_FILE,
+      });
 
       if (!file) return;
 
@@ -796,7 +920,9 @@ export const fileRouter = router({
       if (!existing) throw new TRPCError({ code: 'NOT_FOUND', message: 'File not found' });
       await assertFileNotInRestrictedKnowledgeBase(ctx, input.id);
 
-      const file = await ctx.fileModel.deleteUnreferenced(input.id, serverDBEnv.REMOVE_GLOBAL_FILE);
+      const file = await ctx.fileModel.deleteUnreferenced(input.id, {
+        removeGlobalFile: serverDBEnv.REMOVE_GLOBAL_FILE,
+      });
       if (!file) return;
 
       await ctx.fileService.deleteFile(file.url!);
@@ -871,7 +997,7 @@ export const fileRouter = router({
       const updates: Parameters<typeof ctx.fileModel.update>[1] = {};
 
       if (metadata !== undefined) {
-        updates.metadata = metadata;
+        updates.metadata = stripAgentShareFileProvenance(metadata);
       }
 
       if (name !== undefined) {
